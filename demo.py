@@ -771,17 +771,30 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
                 st.caption("Install `streamlit-paste-button` to enable clipboard paste.")
 
         # Resolve image source: file upload takes priority, then clipboard paste
+        using_pasted = False
         uploaded_image = None
         if uploaded_file is not None:
             uploaded_image = Image.open(uploaded_file)
-        elif "pasted_refine_image" in st.session_state and st.session_state["pasted_refine_image"] is not None:
+        elif st.session_state.get("pasted_refine_image") is not None:
             uploaded_image = st.session_state["pasted_refine_image"]
+            using_pasted = True
 
         if uploaded_image is not None:
             col1, col2 = st.columns(2)
-            
+
             with col1:
-                st.markdown("### Original Image")
+                if using_pasted:
+                    label_col, btn_col = st.columns([2, 1])
+                    with label_col:
+                        st.markdown("### Original Image")
+                        st.caption("📋 From clipboard")
+                    with btn_col:
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        if st.button("✕ Remove", key="clear_pasted_image", help="Remove the pasted image"):
+                            del st.session_state["pasted_refine_image"]
+                            st.rerun()
+                else:
+                    st.markdown("### Original Image")
                 st.image(uploaded_image, use_container_width=True)
             
             with col2:
