@@ -764,7 +764,12 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
             st.markdown("<br>", unsafe_allow_html=True)
             try:
                 from streamlit_paste_button import paste_image_button
-                paste_result = paste_image_button("📋 Paste from clipboard", key="refine_paste_btn")
+                if "refine_paste_key" not in st.session_state:
+                    st.session_state["refine_paste_key"] = 0
+                paste_result = paste_image_button(
+                    "📋 Paste from clipboard",
+                    key=f"refine_paste_btn_{st.session_state['refine_paste_key']}",
+                )
                 if paste_result.image_data is not None:
                     st.session_state["pasted_refine_image"] = paste_result.image_data
             except ImportError:
@@ -792,6 +797,7 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
                         st.markdown("<br>", unsafe_allow_html=True)
                         if st.button("✕ Remove", key="clear_pasted_image", help="Remove the pasted image"):
                             del st.session_state["pasted_refine_image"]
+                            st.session_state["refine_paste_key"] += 1
                             st.rerun()
                 else:
                     st.markdown("### Original Image")
