@@ -165,69 +165,89 @@ async def process_parallel_candidates(data_list, exp_mode="dev_planner_critic", 
 
 async def refine_image_with_nanoviz(image_bytes, edit_prompt, aspect_ratio="21:9", image_size="2K"):
     """
-    Refine an image using an Image Editing API.
-    
+    Refine an image using OpenRouter API.
+
     Args:
         image_bytes: Image data in bytes
         edit_prompt: Text description of desired changes
         aspect_ratio: Output aspect ratio (21:9, 16:9, 3:2)
         image_size: Output resolution (2K or 4K)
-    
+
     Returns:
         Tuple of (edited_image_bytes, success_message)
     """
     try:
-        from google import genai
-        from google.genai import types
-        
-        # Initialize client
-        project_id = get_config_val("google_cloud", "project_id", "GOOGLE_CLOUD_PROJECT", "")
-        location = get_config_val("google_cloud", "location", "GOOGLE_CLOUD_LOCATION", "global")
-        
-        client = genai.Client(vertexai=True, project=project_id, location=location)
-        
-        # Prepare content
-        contents = [
-            types.Part.from_text(text=edit_prompt),
-            types.Part.from_bytes(
-                mime_type="image/jpeg",
-                data=image_bytes
-            )
-        ]
-        
-        # Configure generation
-        config = types.GenerateContentConfig(
-            temperature=1.0,
-            max_output_tokens=8192,
-            response_modalities=["IMAGE"],
-            image_config=types.ImageConfig(
-                aspect_ratio=aspect_ratio,
-                image_size=image_size,
-            ),
-        )
-        
-        # Generate refined image
+        import requests
+
+        # Get API key and model
+        api_key = get_config_val("api_keys", "openrouter_api_key", "OPENROUTER_API_KEY", "")
         image_model = get_config_val("defaults", "image_model_name", "IMAGE_MODEL_NAME", "")
+
+        # Convert image bytes to base64
+        image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+
+        # Prepare the request
+        payload = {
+            "model": image_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"Edit this image according to the following instructions. Output aspect ratio: {aspect_ratio}, resolution: {image_size}. Instructions: {edit_prompt}"
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "modalities": ["image", "text"]
+        }
+
+        # Make the request
         response = await asyncio.to_thread(
-            client.models.generate_content,
-            model=image_model,
-            contents=contents,
-            config=config
+            requests.post,
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "HTTP-Referer": "https://paperbanana.app",
+                "X-Title": "PaperBanana",
+                "Content-Type": "application/json"
+            },
+            json=payload
         )
-        
-        # Extract image from response
-        if response.candidates and response.candidates[0].content.parts:
-            for part in response.candidates[0].content.parts:
-                if hasattr(part, 'inline_data') and part.inline_data:
-                    edited_image_data = part.inline_data.data
-                    
-                    if isinstance(edited_image_data, bytes):
-                        return edited_image_data, "✅ Image refined successfully!"
-                    elif isinstance(edited_image_data, str):
-                        return base64.b64decode(edited_image_data), "✅ Image refined successfully!"
-        
-        return None, "❌ No image data found in response"
-    
+
+        if response.status_code != 200:
+            return None, f"❌ API error: {response.status_code} - {response.text[:200]}"
+
+        data = response.json()
+
+        # Extract image from the images field
+        if data.get("choices") and data["choices"][0].get("message"):
+            message = data["choices"][0]["message"]
+
+            # Check for images in the response
+            if message.get("images") and len(message["images"]) > 0:
+                image_data = message["images"][0]
+                if image_data.get("image_url", {}).get("url", "").startswith("data:image"):
+                    # Extract base64 data from data URL
+                    import re
+                    match = re.search(r'base64,(.+)', image_data["image_url"]["url"])
+                    if match:
+                        return base64.b64decode(match.group(1)), "✅ Image refined successfully!"
+
+            # Fallback: check content field
+            content = message.get("content")
+            if content:
+                return None, f"❌ Model returned text instead of image: {content[:200]}..."
+
+        return None, "❌ No image in response"
+
     except Exception as e:
         return None, f"❌ Error: {str(e)}"
 
@@ -760,6 +780,9 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
                             try:
                                 # Convert PIL image to bytes
                                 img_byte_arr = BytesIO()
+                                # Convert RGBA to RGB if needed (JPEG doesn't support transparency)
+                                if uploaded_image.mode == 'RGBA':
+                                    uploaded_image = uploaded_image.convert('RGB')
                                 uploaded_image.save(img_byte_arr, format='JPEG')
                                 image_bytes = img_byte_arr.getvalue()
                                 
