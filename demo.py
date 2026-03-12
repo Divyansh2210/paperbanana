@@ -752,15 +752,32 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
         
         # Upload section
         st.markdown("## 📤 Upload Image")
-        uploaded_file = st.file_uploader(
-            "Choose an image file",
-            type=["png", "jpg", "jpeg"],
-            help="Upload the diagram you want to refine"
-        )
-        
+
+        upload_col, paste_col = st.columns([3, 1])
+        with upload_col:
+            uploaded_file = st.file_uploader(
+                "Choose an image file",
+                type=["png", "jpg", "jpeg"],
+                help="Upload the diagram you want to refine"
+            )
+        with paste_col:
+            st.markdown("<br>", unsafe_allow_html=True)
+            try:
+                from streamlit_paste_button import paste_image_button
+                paste_result = paste_image_button("📋 Paste from clipboard", key="refine_paste_btn")
+                if paste_result.image_data is not None:
+                    st.session_state["pasted_refine_image"] = paste_result.image_data
+            except ImportError:
+                st.caption("Install `streamlit-paste-button` to enable clipboard paste.")
+
+        # Resolve image source: file upload takes priority, then clipboard paste
+        uploaded_image = None
         if uploaded_file is not None:
-            # Display uploaded image
             uploaded_image = Image.open(uploaded_file)
+        elif "pasted_refine_image" in st.session_state and st.session_state["pasted_refine_image"] is not None:
+            uploaded_image = st.session_state["pasted_refine_image"]
+
+        if uploaded_image is not None:
             col1, col2 = st.columns(2)
             
             with col1:

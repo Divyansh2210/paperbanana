@@ -321,3 +321,68 @@ def test_rgb_image_unchanged():
     if img.mode == "RGBA":
         img = img.convert("RGB")
     assert img.mode == original_mode == "RGB"
+
+
+# ---------------------------------------------------------------------------
+# Clipboard paste image source resolution
+# ---------------------------------------------------------------------------
+
+def test_clipboard_paste_image_used_when_no_file_upload():
+    """
+    When no file is uploaded but a pasted image exists in session_state,
+    the pasted image must be selected as the source.
+    """
+    pasted_img = Image.new("RGB", (16, 16), color=(10, 20, 30))
+    session_state = {"pasted_refine_image": pasted_img}
+
+    uploaded_file = None
+    uploaded_image = None
+    if uploaded_file is not None:
+        uploaded_image = Image.open(uploaded_file)
+    elif session_state.get("pasted_refine_image") is not None:
+        uploaded_image = session_state["pasted_refine_image"]
+
+    assert uploaded_image is pasted_img
+
+
+def test_file_upload_takes_priority_over_clipboard_paste():
+    """
+    When both a file and a clipboard paste are present,
+    the file upload must take priority.
+    """
+    from io import BytesIO as _BytesIO
+    pasted_img = Image.new("RGB", (16, 16), color=(10, 20, 30))
+
+    file_img = Image.new("RGB", (8, 8), color=(200, 100, 50))
+    buf = _BytesIO()
+    file_img.save(buf, format="PNG")
+    buf.seek(0)
+
+    session_state = {"pasted_refine_image": pasted_img}
+
+    # Simulate: uploaded_file is not None
+    uploaded_image = None
+    if buf is not None:
+        uploaded_image = Image.open(buf)
+    elif session_state.get("pasted_refine_image") is not None:
+        uploaded_image = session_state["pasted_refine_image"]
+
+    assert uploaded_image is not pasted_img
+    assert uploaded_image.size == (8, 8)
+
+
+def test_no_image_when_both_sources_absent():
+    """
+    When neither file upload nor clipboard paste is present,
+    uploaded_image must be None.
+    """
+    session_state = {}
+
+    uploaded_file = None
+    uploaded_image = None
+    if uploaded_file is not None:
+        uploaded_image = Image.open(uploaded_file)
+    elif session_state.get("pasted_refine_image") is not None:
+        uploaded_image = session_state["pasted_refine_image"]
+
+    assert uploaded_image is None
