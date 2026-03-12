@@ -13,10 +13,12 @@
 # limitations under the License.
 
 """
-Utility functions for interacting with Gemini and Claude APIs, image processing, and PDF handling.
+Utility functions for interacting with model APIs, image processing, and PDF handling.
+All generative model calls are routed through OpenRouter.
 """
 
 import json
+import re
 import asyncio
 import base64
 from io import BytesIO
@@ -25,8 +27,8 @@ from ast import literal_eval
 from typing import List, Dict, Any
 
 import aiofiles
+import httpx
 from PIL import Image
-from google import genai
 from google.genai import types
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
@@ -49,15 +51,21 @@ def get_config_val(section, key, env_var, default=""):
         val = model_config[section].get(key)
     return val or default
 
-# Initialize clients lazily or with robust defaults
-api_key = get_config_val("api_keys", "google_api_key", "GOOGLE_API_KEY", "")
-if api_key:
-    gemini_client = genai.Client(api_key=api_key)
-    print("Initialized Gemini Client with API Key")
+# OpenRouter client — used for all generative model calls (text + image)
+openrouter_api_key = get_config_val("api_keys", "openrouter_api_key", "OPENROUTER_API_KEY", "")
+if openrouter_api_key:
+    openrouter_client = AsyncOpenAI(
+        api_key=openrouter_api_key,
+        base_url="https://openrouter.ai/api/v1",
+        default_headers={
+            "HTTP-Referer": "https://paperbanana.app",
+            "X-Title": "PaperBanana",
+        },
+    )
+    print("Initialized OpenRouter Client")
 else:
-    print("Warning: Could not initialize Gemini Client. Missing credentials.")
-    gemini_client = None
-
+    print("Warning: Could not initialize OpenRouter Client. Missing openrouter_api_key.")
+    openrouter_client = None
 
 anthropic_api_key = get_config_val("api_keys", "anthropic_api_key", "ANTHROPIC_API_KEY", "")
 if anthropic_api_key:
@@ -76,110 +84,157 @@ else:
     openai_client = None
 
 
+def _convert_to_openrouter_messages(
+    contents: List[Dict[str, Any]], system_instruction: str = ""
+) -> List[Dict[str, Any]]:
+    """Build an OpenAI-compatible messages list from the generic content list."""
+    user_content = _convert_to_openai_format(contents)
+    messages = []
+    if system_instruction:
+        messages.append({"role": "system", "content": system_instruction})
+    messages.append({"role": "user", "content": user_content})
+    return messages
 
-def _convert_to_gemini_parts(contents: List[Dict[str, Any]]) -> List[types.Part]:
+
+def _extract_image_b64_from_openrouter_response(data: dict) -> str | None:
     """
-    Convert a generic content list to a list of Gemini's genai.types.Part objects.
+    Extract a base64-encoded image string from an OpenRouter JSON response.
+    Handles both the standard content-list format and the custom 'images' field
+    that some OpenRouter image models return.
     """
-    gemini_parts = []
-    for item in contents:
-        if item.get("type") == "text":
-            gemini_parts.append(types.Part.from_text(text=item["text"]))
-        elif item.get("type") == "image":
-            source = item.get("source", {})
-            if source.get("type") == "base64":
-                gemini_parts.append(
-                    types.Part.from_bytes(
-                        data=base64.b64decode(source["data"]),
-                        mime_type=source["media_type"],
-                    )
-                )
-    return gemini_parts
+    try:
+        message = data["choices"][0]["message"]
+
+        # Format 1: content is a list of typed blocks
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "image_url":
+                    url = block.get("image_url", {}).get("url", "")
+                    m = re.search(r"base64,(.+)", url, re.DOTALL)
+                    if m:
+                        return m.group(1).strip()
+
+        # Format 2: custom 'images' list (OpenRouter-specific)
+        images = message.get("images")
+        if images:
+            url = images[0].get("image_url", {}).get("url", "")
+            m = re.search(r"base64,(.+)", url, re.DOTALL)
+            if m:
+                return m.group(1).strip()
+
+        # Format 3: content is a plain data-URL string
+        if isinstance(content, str) and content.startswith("data:image"):
+            m = re.search(r"base64,(.+)", content, re.DOTALL)
+            if m:
+                return m.group(1).strip()
+    except (KeyError, IndexError, TypeError):
+        pass
+    return None
 
 
 async def call_gemini_with_retry_async(
     model_name, contents, config, max_attempts=5, retry_delay=5, error_context=""
 ):
     """
-    ASYNC: Call Gemini API with asynchronous retry logic.
+    Route all generative model calls through OpenRouter.
+    Accepts the same interface as before (google.genai types.GenerateContentConfig)
+    so all agents work without changes.
+    Handles both text and image generation based on config.response_modalities.
     """
-    if gemini_client is None:
+    if openrouter_client is None:
         raise RuntimeError(
-            "Gemini client was not initialized: missing Google API key. "
-            "Please set GOOGLE_API_KEY in environment, or configure api_keys.google_api_key in configs/model_config.yaml."
+            "OpenRouter client was not initialized. "
+            "Please set openrouter_api_key in configs/model_config.yaml."
         )
 
-    result_list = []
-    target_candidate_count = config.candidate_count
-    # Gemini API max candidate count is 8. We will call multiple times if needed.
-    if config.candidate_count > 8:
-        config.candidate_count = 8
+    is_image_gen = bool(
+        getattr(config, "response_modalities", None)
+        and "IMAGE" in config.response_modalities
+    )
+    system_instruction = getattr(config, "system_instruction", None) or ""
+    temperature = getattr(config, "temperature", 1.0)
+    max_tokens = getattr(config, "max_output_tokens", 8192)
+    target_candidate_count = getattr(config, "candidate_count", 1)
 
-    current_contents = contents
+    messages = _convert_to_openrouter_messages(contents, system_instruction)
+    result_list = []
+
     for attempt in range(max_attempts):
         try:
-            # Use global client
-            client = gemini_client
+            if is_image_gen:
+                # Image generation — use httpx directly to access raw JSON
+                # (OpenRouter image responses may use custom fields not in the OpenAI schema)
+                image_config = getattr(config, "image_config", None)
+                extra_body: Dict[str, Any] = {"modalities": ["image", "text"]}
+                if image_config:
+                    if getattr(image_config, "aspect_ratio", None):
+                        extra_body["aspect_ratio"] = image_config.aspect_ratio
+                    if getattr(image_config, "image_size", None):
+                        extra_body["image_size"] = image_config.image_size
 
-            # Convert generic content list to Gemini's format right before the API call
-            gemini_contents = _convert_to_gemini_parts(current_contents)
-            response = await client.aio.models.generate_content(
-                model=model_name, contents=gemini_contents, config=config
-            )
-
-            # If we are using Image Generation models to generate images
-            if (
-                "nanoviz" in model_name
-                or "image" in model_name
-            ):
-                raw_response_list = []
-                if not response.candidates or not response.candidates[0].content.parts:
-                    print(
-                        f"[Warning]: Failed to generate image, retrying in {retry_delay} seconds..."
+                payload = {
+                    "model": model_name,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    **extra_body,
+                }
+                async with httpx.AsyncClient(timeout=120) as http:
+                    resp = await http.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {openrouter_api_key}",
+                            "HTTP-Referer": "https://paperbanana.app",
+                            "X-Title": "PaperBanana",
+                            "Content-Type": "application/json",
+                        },
+                        json=payload,
                     )
+
+                if resp.status_code != 200:
+                    raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+
+                image_b64 = _extract_image_b64_from_openrouter_response(resp.json())
+                if image_b64:
+                    result_list.append(image_b64)
+                    break
+                else:
+                    print(f"[Warning]: No image in response, retrying in {retry_delay}s...")
                     await asyncio.sleep(retry_delay)
                     continue
 
-                # In this mode, we can only have one candidate
-                for part in response.candidates[0].content.parts:
-                    if part.inline_data:
-                        # Append base64 encoded image data to raw_response_list
-                        raw_response_list.append(
-                            base64.b64encode(part.inline_data.data).decode("utf-8")
-                        )
-                        break
-
-            # Otherwise, for text generation models
             else:
-                raw_response_list = [
-                    part.text
-                    for candidate in response.candidates
-                    for part in candidate.content.parts
-                ]
-            result_list.extend([r for r in raw_response_list if r.strip() != ""])
-            if len(result_list) >= target_candidate_count:
-                result_list = result_list[:target_candidate_count]
-                break
+                # Text generation — use AsyncOpenAI client
+                response = await openrouter_client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                text = (response.choices[0].message.content or "").strip()
+                if text:
+                    result_list.append(text)
+                    if len(result_list) >= target_candidate_count:
+                        break
 
         except Exception as e:
             context_msg = f" for {error_context}" if error_context else ""
-            
-            # Exponential backoff (capped at 30s)
             current_delay = min(retry_delay * (2 ** attempt), 30)
-            
             print(
-                f"Attempt {attempt + 1} for model {model_name} failed{context_msg}: {e}. Retrying in {current_delay} seconds..."
+                f"Attempt {attempt + 1} for model {model_name} failed{context_msg}: {e}. "
+                f"Retrying in {current_delay}s..."
             )
-
             if attempt < max_attempts - 1:
                 await asyncio.sleep(current_delay)
             else:
                 print(f"Error: All {max_attempts} attempts failed{context_msg}")
-                result_list = ["Error"] * target_candidate_count
 
-    if len(result_list) < target_candidate_count:
+    if not result_list:
+        result_list = ["Error"] * target_candidate_count
+    elif len(result_list) < target_candidate_count:
         result_list.extend(["Error"] * (target_candidate_count - len(result_list)))
-    return result_list
+    return result_list[:target_candidate_count]
 
 def _convert_to_claude_format(contents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """

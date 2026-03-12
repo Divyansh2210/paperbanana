@@ -165,7 +165,9 @@ async def process_parallel_candidates(data_list, exp_mode="dev_planner_critic", 
 
 async def refine_image_with_nanoviz(image_bytes, edit_prompt, aspect_ratio="21:9", image_size="2K"):
     """
-    Refine an image using OpenRouter API.
+    Refine an image using a 2-step pipeline:
+    1. Text model analyzes the image and generates a new layout description based on edit_prompt
+    2. Image model regenerates the diagram from that description
 
     Args:
         image_bytes: Image data in bytes
@@ -177,76 +179,79 @@ async def refine_image_with_nanoviz(image_bytes, edit_prompt, aspect_ratio="21:9
         Tuple of (edited_image_bytes, success_message)
     """
     try:
-        import requests
+        from utils.generation_utils import call_gemini_with_retry_async
+        from google.genai import types
 
-        # Get API key and model
-        api_key = get_config_val("api_keys", "openrouter_api_key", "OPENROUTER_API_KEY", "")
+        text_model = get_config_val("defaults", "model_name", "MODEL_NAME", "")
         image_model = get_config_val("defaults", "image_model_name", "IMAGE_MODEL_NAME", "")
-
-        # Convert image bytes to base64
         image_base64 = base64.b64encode(image_bytes).decode('utf-8')
 
-        # Prepare the request
-        payload = {
-            "model": image_model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"Edit this image according to the following instructions. Output aspect ratio: {aspect_ratio}, resolution: {image_size}. Instructions: {edit_prompt}"
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_base64}"
-                            }
-                        }
-                    ]
-                }
-            ],
-            "modalities": ["image", "text"]
-        }
-
-        # Make the request
-        response = await asyncio.to_thread(
-            requests.post,
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "HTTP-Referer": "https://paperbanana.app",
-                "X-Title": "PaperBanana",
-                "Content-Type": "application/json"
-            },
-            json=payload
+        # Step 1: Text model analyzes image and plans new layout
+        print(f"🔍 [Refine Step 1] Analyzing image and planning new layout for: '{edit_prompt}'")
+        analysis_prompt = (
+            f"You are a professional academic diagram designer.\n\n"
+            f"Carefully analyze this diagram image and extract ALL its content: every text label, shape, arrow, "
+            f"connection, color, and layout detail.\n\n"
+            f"User instruction: \"{edit_prompt}\"\n\n"
+            f"Generate a detailed, precise description for a NEW version of this diagram that:\n"
+            f"1. Preserves ALL original content and information faithfully\n"
+            f"2. Applies the user's requested changes, especially structural or layout changes\n"
+            f"3. Follows academic paper diagram standards (clean, readable, professional)\n"
+            f"4. Specifies exact positions, colors, shapes, text content, arrows, and connections\n\n"
+            f"Be as specific as possible — this description will be used directly to regenerate the image."
         )
 
-        if response.status_code != 200:
-            return None, f"❌ API error: {response.status_code} - {response.text[:200]}"
+        step1_contents = [
+            {"type": "text", "text": analysis_prompt},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_base64}},
+        ]
 
-        data = response.json()
+        text_response = await call_gemini_with_retry_async(
+            model_name=text_model,
+            contents=step1_contents,
+            config=types.GenerateContentConfig(
+                temperature=1.0,
+                candidate_count=1,
+                max_output_tokens=8192,
+            ),
+            max_attempts=3,
+            retry_delay=5,
+        )
 
-        # Extract image from the images field
-        if data.get("choices") and data["choices"][0].get("message"):
-            message = data["choices"][0]["message"]
+        if not text_response or text_response[0] == "Error":
+            return None, "❌ Step 1 failed: could not analyze image content"
 
-            # Check for images in the response
-            if message.get("images") and len(message["images"]) > 0:
-                image_data = message["images"][0]
-                if image_data.get("image_url", {}).get("url", "").startswith("data:image"):
-                    # Extract base64 data from data URL
-                    import re
-                    match = re.search(r'base64,(.+)', image_data["image_url"]["url"])
-                    if match:
-                        return base64.b64decode(match.group(1)), "✅ Image refined successfully!"
+        new_description = text_response[0]
+        print(f"📝 [Refine Step 1] New layout description (preview): {new_description[:300]}...")
 
-            # Fallback: check content field
-            content = message.get("content")
-            if content:
-                return None, f"❌ Model returned text instead of image: {content[:200]}..."
+        # Step 2: Image model generates the restructured diagram
+        print(f"🎨 [Refine Step 2] Generating restructured diagram from description...")
+        gen_prompt = (
+            f"Generate a professional academic paper diagram based on this detailed description:\n\n{new_description}"
+        )
 
-        return None, "❌ No image in response"
+        image_response = await call_gemini_with_retry_async(
+            model_name=image_model,
+            contents=[{"type": "text", "text": gen_prompt}],
+            config=types.GenerateContentConfig(
+                temperature=1.0,
+                candidate_count=1,
+                max_output_tokens=8192,
+                response_modalities=["IMAGE"],
+                image_config=types.ImageConfig(
+                    aspect_ratio=aspect_ratio,
+                    image_size=image_size.lower(),
+                ),
+            ),
+            max_attempts=3,
+            retry_delay=10,
+        )
+
+        if not image_response or image_response[0] == "Error":
+            return None, "❌ Step 2 failed: could not generate restructured image"
+
+        print(f"✅ [Refine] Done.")
+        return base64.b64decode(image_response[0]), "✅ Image restructured successfully!"
 
     except Exception as e:
         return None, f"❌ Error: {str(e)}"
